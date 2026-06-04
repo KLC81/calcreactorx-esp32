@@ -1,0 +1,7 @@
+.pio/
+.DS_Store
+include/secrets.h
+firmware_backup_*/
+release/*.bin
+release/SHA256SUMS.txt
+
