@@ -88,6 +88,37 @@ http://aquaph.local
 
 自动控制默认关闭。完成低压测试和 pH 校准后，再在网页中主动启用。
 
+## 树莓派 USB 串口接入
+
+当前固件保留本地网页，同时增加 USB 串口 JSON Lines 协议，供
+MyReef 树莓派页面读取状态、保存设置、手动开关阀门和触发校准。ESP32
+仍然独立执行 pH 采样、滤波、自动控制和配置保存；树莓派断开后，ESP32
+继续按最后保存的设置运行。
+
+每条命令是一行 JSON，以 `\n` 结尾；ESP32 返回一行 JSON，成功响应包含
+`ok: true` 和 `snapshot`。
+
+示例：
+
+```json
+{"cmd":"status","id":"pi-1"}
+{"cmd":"settings","id":"pi-2","auto_enabled":true,"open_ph":6.70,"close_ph":6.50}
+{"cmd":"relay","id":"pi-3","on":false}
+{"cmd":"calibrate","id":"pi-4","point":7}
+{"cmd":"calibrate_reset","id":"pi-5"}
+```
+
+支持命令：
+
+- `hello`
+- `status`
+- `heartbeat`
+- `settings`
+- `mode`
+- `relay`
+- `calibrate`
+- `calibrate_reset`
+
 ## 编译与烧录
 
 ```bash

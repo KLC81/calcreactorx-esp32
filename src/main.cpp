@@ -1,5 +1,6 @@
 #include <Adafruit_ADS1X15.h>
 #include <ArduinoOTA.h>
+#include <ArduinoJson.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <WebServer.h>
@@ -45,6 +46,8 @@ struct Settings {
   float valveOpenPh = 6.70f;
   float valveClosePh = 6.50f;
   bool autoEnabled = false;
+  bool ph4Calibrated = false;
+  bool ph7Calibrated = false;
 };
 
 Adafruit_ADS1115 ads;
@@ -68,6 +71,7 @@ float phValue = 0.0f;
 uint32_t lastSampleAt = 0;
 uint32_t relayChangedAt = 0;
 uint32_t lastWifiAttemptAt = 0;
+String serialInput;
 
 const char kPage[] PROGMEM = R"HTML(
 <!doctype html>
@@ -174,6 +178,8 @@ void saveSettings() {
   preferences.putFloat("open_ph", settings.valveOpenPh);
   preferences.putFloat("close_ph", settings.valveClosePh);
   preferences.putBool("auto", settings.autoEnabled);
+  preferences.putBool("ph4_done", settings.ph4Calibrated);
+  preferences.putBool("ph7_done", settings.ph7Calibrated);
 }
 
 void loadSettings() {
@@ -183,6 +189,8 @@ void loadSettings() {
   if (preferences.isKey("open_ph")) settings.valveOpenPh = preferences.getFloat("open_ph");
   if (preferences.isKey("close_ph")) settings.valveClosePh = preferences.getFloat("close_ph");
   if (preferences.isKey("auto")) settings.autoEnabled = preferences.getBool("auto");
+  if (preferences.isKey("ph4_done")) settings.ph4Calibrated = preferences.getBool("ph4_done");
+  if (preferences.isKey("ph7_done")) settings.ph7Calibrated = preferences.getBool("ph7_done");
 }
 
 void setRelay(bool on) {
@@ -276,10 +284,45 @@ String statusJson() {
   json += ",\"ph\":" + String(isnan(phValue) ? 0.0f : phValue, 3);
   json += ",\"ph7_mv\":" + String(settings.ph7Mv, 2);
   json += ",\"ph4_mv\":" + String(settings.ph4Mv, 2);
+  json += ",\"ph7_calibrated\":" + boolJson(settings.ph7Calibrated);
+  json += ",\"ph4_calibrated\":" + boolJson(settings.ph4Calibrated);
+  json += ",\"calibrated\":" + boolJson(settings.ph7Calibrated && settings.ph4Calibrated);
   json += ",\"open_ph\":" + String(settings.valveOpenPh, 2);
   json += ",\"close_ph\":" + String(settings.valveClosePh, 2);
+  json += ",\"uptime_ms\":" + String(millis());
   json += "}";
   return json;
+}
+
+void fillStatusDoc(JsonObject json) {
+  json["ads_ready"] = adsReady;
+  json["wifi_connected"] = WiFi.status() == WL_CONNECTED;
+  json["ip"] = WiFi.localIP().toString();
+  json["rssi"] = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
+  json["ap_ready"] = apReady;
+  json["ap_ip"] = WiFi.softAPIP().toString();
+  json["ap_ssid"] = String(WIFI_AP_SSID);
+  json["ota_ready"] = otaReady;
+  json["ota_in_progress"] = otaInProgress;
+  json["ota_hostname"] = "aquaph";
+  json["ota_port"] = kOtaPort;
+  json["relay_on"] = relayOn;
+  json["auto_enabled"] = settings.autoEnabled;
+  json["settling"] = sampleSettling;
+  json["mv_valid"] = hasFilteredMv;
+  json["ph_valid"] = hasFilteredMv && !isnan(phValue);
+  json["raw_mv"] = rawMv;
+  json["median_mv"] = medianMv;
+  json["filtered_mv"] = filteredMv;
+  json["ph"] = isnan(phValue) ? 0.0f : phValue;
+  json["ph7_mv"] = settings.ph7Mv;
+  json["ph4_mv"] = settings.ph4Mv;
+  json["ph7_calibrated"] = settings.ph7Calibrated;
+  json["ph4_calibrated"] = settings.ph4Calibrated;
+  json["calibrated"] = settings.ph7Calibrated && settings.ph4Calibrated;
+  json["open_ph"] = settings.valveOpenPh;
+  json["close_ph"] = settings.valveClosePh;
+  json["uptime_ms"] = millis();
 }
 
 void sendJson(int status, const String &json) {
@@ -288,6 +331,175 @@ void sendJson(int status, const String &json) {
 
 void sendMessage(const String &message) {
   sendJson(200, "{\"message\":\"" + message + "\"}");
+}
+
+void sendSerialResponse(const String &id, const String &message = "", float voltage = NAN) {
+  StaticJsonDocument<2048> response;
+  response["ok"] = true;
+  if (id.length() > 0) {
+    response["id"] = id;
+  }
+  if (message.length() > 0) {
+    response["message"] = message;
+  }
+  if (!isnan(voltage)) {
+    response["voltage"] = voltage;
+  }
+  JsonObject snapshot = response.createNestedObject("snapshot");
+  fillStatusDoc(snapshot);
+  serializeJson(response, Serial);
+  Serial.println();
+}
+
+void sendSerialError(const String &id, const String &error) {
+  StaticJsonDocument<384> response;
+  response["ok"] = false;
+  if (id.length() > 0) {
+    response["id"] = id;
+  }
+  response["error"] = error;
+  serializeJson(response, Serial);
+  Serial.println();
+}
+
+void handleSerialCommandLine(const String &line) {
+  StaticJsonDocument<768> request;
+  const DeserializationError error = deserializeJson(request, line);
+  if (error) {
+    sendSerialError("", "invalid_json");
+    return;
+  }
+
+  const String id = request["id"] | "";
+  const String cmd = request["cmd"] | "";
+
+  if (cmd == "hello") {
+    StaticJsonDocument<768> response;
+    response["ok"] = true;
+    if (id.length() > 0) {
+      response["id"] = id;
+    }
+    response["device"] = "aquaph-esp32";
+    response["protocol"] = "aquaph-jsonl-v1";
+    response["firmware"] = __DATE__ " " __TIME__;
+    response["message"] = "ready";
+    serializeJson(response, Serial);
+    Serial.println();
+    return;
+  }
+
+  if (cmd == "status" || cmd == "heartbeat") {
+    sendSerialResponse(id);
+    return;
+  }
+
+  if (cmd == "relay") {
+    if (!request.containsKey("on") && !request.containsKey("state")) {
+      sendSerialError(id, "missing_relay_state");
+      return;
+    }
+    settings.autoEnabled = false;
+    saveSettings();
+    setRelay(request.containsKey("on") ? request["on"].as<bool>() : request["state"].as<bool>());
+    sendSerialResponse(id, "manual relay updated");
+    return;
+  }
+
+  if (cmd == "mode") {
+    settings.autoEnabled = request["auto"].as<bool>();
+    saveSettings();
+    if (settings.autoEnabled) {
+      updateAutomaticControl();
+    }
+    sendSerialResponse(id, settings.autoEnabled ? "auto mode enabled" : "manual mode enabled");
+    return;
+  }
+
+  if (cmd == "settings") {
+    const bool hasOpen = request.containsKey("open_ph");
+    const bool hasClose = request.containsKey("close_ph");
+    const float openPh = hasOpen ? request["open_ph"].as<float>() : settings.valveOpenPh;
+    const float closePh = hasClose ? request["close_ph"].as<float>() : settings.valveClosePh;
+    if (openPh <= closePh || openPh > 14.0f || closePh < 0.0f) {
+      sendSerialError(id, "invalid_thresholds");
+      return;
+    }
+    if (hasOpen) {
+      settings.valveOpenPh = openPh;
+    }
+    if (hasClose) {
+      settings.valveClosePh = closePh;
+    }
+    if (request.containsKey("auto_enabled")) {
+      settings.autoEnabled = request["auto_enabled"].as<bool>();
+    } else if (request.containsKey("enabled")) {
+      settings.autoEnabled = request["enabled"].as<bool>();
+    }
+    saveSettings();
+    if (settings.autoEnabled) {
+      updateAutomaticControl();
+    }
+    sendSerialResponse(id, "settings saved");
+    return;
+  }
+
+  if (cmd == "calibrate") {
+    if (!hasFilteredMv || sampleSettling) {
+      sendSerialError(id, "sample_not_stable");
+      return;
+    }
+    const int point = request["point"] | 0;
+    if (point == 7) {
+      settings.ph7Mv = filteredMv;
+      settings.ph7Calibrated = true;
+    } else if (point == 4) {
+      settings.ph4Mv = filteredMv;
+      settings.ph4Calibrated = true;
+    } else {
+      sendSerialError(id, "invalid_calibration_point");
+      return;
+    }
+    saveSettings();
+    phValue = calculatePh(filteredMv);
+    sendSerialResponse(id, "calibration saved", filteredMv / 1000.0f);
+    return;
+  }
+
+  if (cmd == "calibrate_reset") {
+    settings.ph7Mv = 2500.0f;
+    settings.ph4Mv = 3000.0f;
+    settings.ph7Calibrated = false;
+    settings.ph4Calibrated = false;
+    saveSettings();
+    phValue = calculatePh(filteredMv);
+    sendSerialResponse(id, "calibration reset");
+    return;
+  }
+
+  sendSerialError(id, "unknown_cmd");
+}
+
+void handleSerialCommands() {
+  while (Serial.available() > 0) {
+    const char ch = static_cast<char>(Serial.read());
+    if (ch == '\r') {
+      continue;
+    }
+    if (ch == '\n') {
+      const String line = serialInput;
+      serialInput = "";
+      if (line.length() > 0) {
+        handleSerialCommandLine(line);
+      }
+      continue;
+    }
+    if (serialInput.length() < 768) {
+      serialInput += ch;
+    } else {
+      serialInput = "";
+      sendSerialError("", "line_too_long");
+    }
+  }
 }
 
 void setupRoutes() {
@@ -339,8 +551,10 @@ void setupRoutes() {
     }
     if (server.arg("point") == "7") {
       settings.ph7Mv = filteredMv;
+      settings.ph7Calibrated = true;
     } else if (server.arg("point") == "4") {
       settings.ph4Mv = filteredMv;
+      settings.ph4Calibrated = true;
     } else {
       sendJson(400, "{\"error\":\"未知校准点\"}");
       return;
@@ -352,6 +566,8 @@ void setupRoutes() {
   server.on("/api/calibrate/reset", HTTP_POST, []() {
     settings.ph7Mv = 2500.0f;
     settings.ph4Mv = 3000.0f;
+    settings.ph7Calibrated = false;
+    settings.ph4Calibrated = false;
     saveSettings();
     phValue = calculatePh(filteredMv);
     sendMessage("已恢复默认校准");
@@ -438,6 +654,7 @@ void setup() {
 }
 
 void loop() {
+  handleSerialCommands();
   server.handleClient();
   ArduinoOTA.handle();
   if (otaInProgress) {
